@@ -170,7 +170,13 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
                 .await?;
         }
 
-        // Notify that new message is available
+        self.notify_new_message_availability(address).await;
+
+        Ok(message_id)
+    }
+
+    /// Notify that new message is available
+    async fn notify_new_message_availability(&self, address: &ProtocolAddress) {
         let queue_name = format!("{}::{}", address.name(), address.device_id());
 
         let listener = {
@@ -181,8 +187,6 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         if let Some(listener) = listener {
             listener.lock().await.handle_new_messages_available().await;
         }
-
-        Ok(message_id)
     }
 
     pub async fn remove(
