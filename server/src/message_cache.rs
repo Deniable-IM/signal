@@ -80,83 +80,113 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         envelope: &mut Envelope,
         message_guid: &str,
     ) -> Result<u64> {
-        let mut connection = self.pool.get().await?;
-
         let queue_key: String = self.get_message_queue_key(address);
         let queue_metadata_key: String = self.get_message_queue_metadata_key(address);
         let queue_total_index_key: String = self.get_queue_index_key();
 
-        envelope.server_guid = Some(message_guid.to_string());
-        let data = bincode::serialize(&envelope)?;
-
-        let message_guid_exists = cmd("HEXISTS")
-            .arg(&queue_metadata_key)
-            .arg(message_guid)
-            .query_async::<u8>(&mut connection)
-            .await?;
-
-        if message_guid_exists == 1 {
-            let num = cmd("HGET")
+        // Return the message guid if already in cache
+        // Dont store messages twice
+        {
+            let mut connection = self.get_connection().await?;
+            let message_guid_exists = cmd("HEXISTS")
                 .arg(&queue_metadata_key)
                 .arg(message_guid)
-                .query_async::<String>(&mut connection)
+                .query_async::<u8>(&mut connection)
                 .await?;
 
-            return Ok(num.parse().expect("Could not parse redis id"));
+            if message_guid_exists == 1 {
+                let num = cmd("HGET")
+                    .arg(&queue_metadata_key)
+                    .arg(message_guid)
+                    .query_async::<String>(&mut connection)
+                    .await?;
+
+                return Ok(num.parse().expect("Could not parse redis id"));
+            }
         }
 
-        let message_id = cmd("HINCRBY")
-            .arg(&queue_metadata_key)
-            .arg("counter")
-            .arg(1)
-            .query_async::<u64>(&mut connection)
-            .await?;
+        // Store message in cache
+        let message_id = {
+            envelope.server_guid = Some(message_guid.to_string());
+            let data = bincode::serialize(&envelope)?;
+            let mut connection = self.get_connection().await?;
 
-        cmd("ZADD")
-            .arg(&queue_key)
-            .arg("NX")
-            .arg(message_id)
-            .arg(&data)
-            .query_async::<()>(&mut connection)
-            .await?;
+            let message_id = cmd("HINCRBY")
+                .arg(&queue_metadata_key)
+                .arg("counter")
+                .arg(1)
+                .query_async::<u64>(&mut connection)
+                .await?;
 
-        cmd("HSET")
-            .arg(&queue_metadata_key)
-            .arg(message_guid)
-            .arg(message_id)
-            .query_async::<()>(&mut connection)
-            .await?;
+            cmd("ZADD")
+                .arg(&queue_key)
+                .arg("NX")
+                .arg(message_id)
+                .arg(&data)
+                .query_async::<()>(&mut connection)
+                .await?;
 
-        cmd("EXPIRE")
-            .arg(&queue_key)
-            .arg(2678400)
-            .query_async::<()>(&mut connection)
-            .await?;
+            cmd("HSET")
+                .arg(&queue_metadata_key)
+                .arg(message_guid)
+                .arg(message_id)
+                .query_async::<()>(&mut connection)
+                .await?;
 
-        cmd("EXPIRE")
-            .arg(&queue_metadata_key)
-            .arg(2678400)
-            .query_async::<()>(&mut connection)
-            .await?;
+            message_id
+        };
 
-        let time = SystemTime::now();
-        let time_in_millis: u64 = time.duration_since(UNIX_EPOCH)?.as_secs();
-
-        cmd("ZADD")
-            .arg(&queue_total_index_key)
-            .arg("NX")
-            .arg(time_in_millis)
-            .arg(&queue_key)
-            .query_async::<()>(&mut connection)
-            .await?;
-
-        // notifies the message availability manager
-        let queue_name = format!("{}::{}", address.name(), address.device_id());
-        if let Some(listener) = self.listeners.lock().await.get(&queue_name) {
-            listener.lock().await.handle_new_messages_available().await;
+        // Delete queue key after 31 days
+        {
+            let mut connection = self.get_connection().await?;
+            cmd("EXPIRE")
+                .arg(&queue_key)
+                .arg(2678400)
+                .query_async::<()>(&mut connection)
+                .await?;
         }
+
+        // Delete queue metadata key after 31 days
+        {
+            let mut connection = self.get_connection().await?;
+            cmd("EXPIRE")
+                .arg(&queue_metadata_key)
+                .arg(2678400)
+                .query_async::<()>(&mut connection)
+                .await?;
+        }
+
+        // Allows sort by insertion time
+        {
+            let mut connection = self.get_connection().await?;
+            let time = SystemTime::now();
+            let time_in_millis: u64 = time.duration_since(UNIX_EPOCH)?.as_secs();
+            cmd("ZADD")
+                .arg(&queue_total_index_key)
+                .arg("NX")
+                .arg(time_in_millis)
+                .arg(&queue_key)
+                .query_async::<()>(&mut connection)
+                .await?;
+        }
+
+        self.notify_new_message_availability(address).await;
 
         Ok(message_id)
+    }
+
+    /// Notify that new message is available
+    async fn notify_new_message_availability(&self, address: &ProtocolAddress) {
+        let queue_name = format!("{}::{}", address.name(), address.device_id());
+
+        let listener = {
+            let listener_map = self.listeners.lock().await;
+            listener_map.get(&queue_name).cloned()
+        };
+
+        if let Some(listener) = listener {
+            listener.lock().await.handle_new_messages_available().await;
+        }
     }
 
     pub async fn remove(
@@ -164,7 +194,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         address: &ProtocolAddress,
         message_guids: Vec<String>,
     ) -> Result<Vec<Envelope>> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
 
         let queue_key: String = self.get_message_queue_key(address);
         let queue_metadata_key: String = self.get_message_queue_metadata_key(address);
@@ -240,7 +270,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
     }
 
     pub async fn has_messages(&self, address: &ProtocolAddress) -> Result<bool> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
 
         let msg_count = cmd("ZCARD")
             .arg(self.get_message_queue_key(address))
@@ -274,7 +304,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         address: &ProtocolAddress,
         after_message_id: i32,
     ) -> Result<Vec<Vec<u8>>> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
         let queue_key = self.get_message_queue_key(address);
         let queue_lock_key = self.get_persist_in_progress_key(address);
         let message_sort = format!("({}", after_message_id);
@@ -309,7 +339,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         address: &ProtocolAddress,
         limit: i32,
     ) -> Result<Vec<Envelope>> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
 
         let messages = cmd("ZRANGE")
             .arg(self.get_message_queue_key(address))
@@ -331,7 +361,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
         max_time: u64,
         limit: u8,
     ) -> Result<Vec<String>> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
         let queue_index_key = self.get_queue_index_key();
 
         let results = cmd("ZRANGE")
@@ -356,7 +386,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
     }
 
     pub async fn lock_queue_for_persistence(&self, address: &ProtocolAddress) -> Result<()> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
 
         cmd("SETEX")
             .arg(self.get_persist_in_progress_key(address))
@@ -369,7 +399,7 @@ impl<T: MessageAvailabilityListener> MessageCache<T> {
     }
 
     pub async fn unlock_queue_for_persistence(&self, address: &ProtocolAddress) -> Result<()> {
-        let mut connection = self.pool.get().await?;
+        let mut connection = self.get_connection().await?;
 
         cmd("DEL")
             .arg(self.get_persist_in_progress_key(address))
