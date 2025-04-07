@@ -60,7 +60,6 @@ async fn make_client(
 
 fn get_server_info() -> (Option<String>, String) {
     let use_tls = !env::args().any(|arg| arg == "--no-tls");
-    println!("Using tls: {}", use_tls);
     if use_tls {
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -108,17 +107,24 @@ async fn receive_all_messages(
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     dotenv()?;
-
+    let debug_print = match args[2].as_str() {
+        "true" => true,
+        _ => false,
+    };
     let (cert_path, server_url) = get_server_info();
     let mut user = make_client(&args[1], &args[2], &cert_path, &server_url).await;
-    println!("Started client with id: {}", &user.aci.service_id_string());
+    if debug_print {
+        println!("Started client with id: {}", &user.aci.service_id_string());
+    }
 
     let mut contact_names = HashMap::new();
     let default_sender = "Unknown Sender".to_owned();
 
     let send_regex = Regex::new(r"send:(?<alias>\w+):(?<text>(\w+\s)*)").unwrap();
     loop {
-        println!("Enter command: ");
+        if debug_print {
+            println!("Enter command: ");
+        }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.starts_with("send") {
